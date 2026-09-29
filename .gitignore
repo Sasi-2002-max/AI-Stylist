@@ -1,8 +1,22 @@
-.env
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Virtual environments
 .venv/
-chroma_db/
-node_modules/
-dist/
-*.loga
+venv/
+env/
+
+# Environment/secrets
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
