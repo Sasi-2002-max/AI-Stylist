@@ -30,22 +30,30 @@ files, does not call MCP server internals, and does not call an LLM.
 Product fields are passed through without fabrication. In particular,
 image_url and product_url are preserved independently exactly as returned
 by the MCP client.
+
+Part 40: search_outfit() takes the Stylist Agent's OutfitPlan and searches
+each outfit item independently through the same MCP client.
+
+Part 41: select_outfit() / build_outfit() pick the top-ranked candidate for
+each outfit item and return one complete outfit, without any extra search.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
+from backend.schemas.outfit import OutfitItem, OutfitPlan
 from backend.shopping.mcp_client import MCPShoppingClient
 from backend.shopping.product_normalizer import Product
 from backend.shopping.product_ranker import rank_products
 
 
 # ---------------------------------------------------------------------------
-# Natural-language requirement extraction
+# Category / color vocabulary
 # ---------------------------------------------------------------------------
 
+# Every value on the right must be a category that exists in the catalog.
 _CATEGORY_ALIASES: Dict[str, str] = {
     "t-shirt": "t-shirts",
     "tshirt": "t-shirts",
@@ -86,7 +94,30 @@ _CATEGORY_ALIASES: Dict[str, str] = {
 
     "accessory": "accessories",
     "accessories": "accessories",
+
+    # Part 40 additions (each maps to an existing catalog category)
+    "chino": "pants",
+    "chinos": "pants",
+    "sneaker": "shoes",
+    "sneakers": "shoes",
+    "loafer": "shoes",
+    "loafers": "shoes",
+    "sandal": "shoes",
+    "sandals": "shoes",
+    "heels": "shoes",
+    "boots": "shoes",
+    "footwear": "shoes",
+    "blouse": "tops",
+    "handbag": "bags",
+    "clutch": "bags",
+    "necklace": "accessories",
+    "earring": "accessories",
+    "earrings": "accessories",
 }
+
+# Broad buckets: when the stylist's category resolves to one of these, the
+# item description may refine it (e.g. "accessory" + "silver watch" -> watches).
+_GENERIC_CATEGORIES = frozenset({"tops", "accessories"})
 
 
 _COLOR_VOCABULARY = (
@@ -108,6 +139,20 @@ _COLOR_VOCABULARY = (
     "blue",
 )
 
+# Spelling variants -> the catalog's spelling.
+_COLOR_ALIASES: Dict[str, str] = {
+    "gray": "grey",
+    "navy blue": "navy",
+}
+
+_KNOWN_COLORS = frozenset(_COLOR_ALIASES.get(c, c) for c in _COLOR_VOCABULARY)
+
+_WORD_PATTERN = re.compile(r"[a-z][a-z\-]*")
+
+
+# ---------------------------------------------------------------------------
+# Natural-language requirement extraction (existing behaviour)
+# ---------------------------------------------------------------------------
 
 # A budget is recognized when accompanied by a currency symbol or an
 # explicit budget-related trigger word.
@@ -188,6 +233,143 @@ def extract_requirements(request_text: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Stylist item -> shopping requirements (Part 40)
+# ---------------------------------------------------------------------------
+
+
+def _category_from_text(text: Optional[str]) -> Optional[str]:
+    """
+    Whole-word category lookup. When several words match, the LAST one wins
+    (the head noun in English: "shirt dress" -> dresses).
+    """
+    if not text:
+        return None
+
+    lowered = re.sub(r"\bt\s+shirts?\b", "t-shirt", text.lower())
+
+    match: Optional[str] = None
+    for word in _WORD_PATTERN.findall(lowered):
+        canonical = _CATEGORY_ALIASES.get(word.strip("-"))
+        if canonical is not None:
+            match = canonical
+
+    return match
+
+
+def resolve_item_category(item: OutfitItem) -> Optional[str]:
+    """
+    Map a stylist OutfitItem to a catalog category, or None if unsupported.
+
+    The stylist's own category wins unless it is a broad bucket
+    ("tops", "accessories") or unrecognised, in which case the item
+    description is consulted. Nothing is guessed: no match -> None.
+    """
+    from_category = _category_from_text(item.category)
+
+    if from_category is not None and from_category not in _GENERIC_CATEGORIES:
+        return from_category
+
+    from_item = _category_from_text(item.item)
+
+    return from_item if from_item is not None else from_category
+
+
+def normalize_color(color: Optional[str]) -> Optional[str]:
+    """Return the catalog spelling of a known color, else None (no guessing)."""
+    if not color:
+        return None
+
+    cleaned = " ".join(color.lower().split())
+    cleaned = _COLOR_ALIASES.get(cleaned, cleaned)
+
+    return cleaned if cleaned in _KNOWN_COLORS else None
+
+
+# Per-item statuses returned by search_outfit()
+STATUS_OK = "ok"
+STATUS_NO_RESULTS = "no_results"
+STATUS_UNSUPPORTED = "unsupported_category"
+
+
+# ---------------------------------------------------------------------------
+# Complete-outfit selection (Part 41)
+# ---------------------------------------------------------------------------
+
+# Overall outfit statuses returned by select_outfit() / build_outfit()
+OUTFIT_COMPLETE = "complete"
+OUTFIT_INCOMPLETE = "incomplete"
+
+
+def select_outfit(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Select ONE product per outfit item from search_outfit() results.
+
+    Pure function: no MCP call, no search. Every selected product is the
+    first (highest-ranked) candidate of its own outfit item, in the same
+    order as the input.
+
+    Returns:
+
+        {
+            "status": "complete" | "incomplete",
+            "selected_products": [
+                {"product_id": "...", "category": "...", "item_index": 0},
+            ],
+            "total_price": 4597.0,       # sum of the selected products' real prices
+            "missing_items": [           # empty when complete
+                {"index": 2, "item": {...}, "status": "no_results"
+                                                     | "unsupported_category"},
+            ],
+        }
+
+    An outfit is "complete" only when EVERY outfit item has a selected
+    product. Items with no candidates (no_results / unsupported_category)
+    are reported in missing_items; nothing is invented for them, and
+    total_price then covers only the products that were selected.
+    An outfit with no items at all is "incomplete".
+    """
+
+    selected: List[Dict[str, Any]] = []
+    missing: List[Dict[str, Any]] = []
+    total = 0.0
+
+    for entry in candidates:
+
+        products = entry.get("products") or []
+
+        if not products:
+            missing.append(
+                {
+                    "index": entry.get("index"),
+                    "item": entry.get("item"),
+                    "status": entry.get("status"),
+                }
+            )
+            continue
+
+        best = products[0]
+
+        selected.append(
+            {
+                "product_id": best["product_id"],
+                "category": best["category"],
+                "item_index": entry.get("index"),
+            }
+        )
+
+        total += float(best["price"])
+
+    is_complete = bool(candidates) and not missing
+
+    return {
+        "status": OUTFIT_COMPLETE if is_complete else OUTFIT_INCOMPLETE,
+        "selected_products": selected,
+        "total_price": round(total, 2),
+        "missing_items": missing,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Shopping Agent
 # ---------------------------------------------------------------------------
 
@@ -207,6 +389,88 @@ class ShoppingAgent:
       - never fabricates image or product URLs
       - propagates MCP infrastructure errors unchanged
     """
+
+    async def _search_with_client(
+        self,
+        client: Any,
+        *,
+        query: str = "",
+        budget: Optional[float] = None,
+        category: Optional[str] = None,
+        color: Optional[str] = None,
+        size: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Search, size-filter and rank using an already-connected client.
+
+        MCPConnectionError and MCPToolError are intentionally not caught.
+        """
+
+        raw_products = await client.search_products(
+            query=query,
+            budget=budget,
+            category=category,
+            color=color,
+        )
+
+        if not raw_products:
+            return []
+
+        products = [
+            Product.model_validate(raw_product)
+            for raw_product in raw_products
+        ]
+
+        # -------------------------------------------------------------------
+        # Size-specific availability filtering
+        # -------------------------------------------------------------------
+
+        if size:
+            requested_size = size.strip().lower()
+
+            size_confirmed: List[Product] = []
+
+            for product in products:
+
+                has_size = any(
+                    available_size.strip().lower() == requested_size
+                    for available_size in product.sizes
+                )
+
+                # Do not call availability when the product does not
+                # even advertise the requested size.
+                if not has_size:
+                    continue
+
+                availability = await client.check_availability(
+                    product.product_id,
+                    size=size,
+                )
+
+                if availability.get("available") is True:
+                    size_confirmed.append(product)
+
+            products = size_confirmed
+
+        # -------------------------------------------------------------------
+        # Rank with the existing deterministic ranker.
+        # -------------------------------------------------------------------
+
+        requirements = {
+            "category": category,
+            "color": color,
+            "budget": budget,
+        }
+
+        ranked = rank_products(
+            products,
+            requirements,
+        )
+
+        return [
+            product.model_dump()
+            for product in ranked
+        ]
 
     async def search(
         self,
@@ -231,72 +495,134 @@ class ShoppingAgent:
         """
 
         async with MCPShoppingClient() as client:
-
-            raw_products = await client.search_products(
+            return await self._search_with_client(
+                client,
                 query=query,
                 budget=budget,
                 category=category,
                 color=color,
+                size=size,
             )
 
-            if not raw_products:
-                return []
+    async def search_outfit(
+        self,
+        outfit_plan: Union[OutfitPlan, Dict[str, Any]],
+        sizes: Optional[Dict[str, str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Search products for every item in a Stylist Agent OutfitPlan.
 
-            products = [
-                Product.model_validate(raw_product)
-                for raw_product in raw_products
-            ]
+        Both plan.items and plan.accessories are searched, in that order,
+        each item independently (never combined into one query).
 
-            # ---------------------------------------------------------------
-            # Size-specific availability filtering
-            # ---------------------------------------------------------------
+        Args:
+            outfit_plan: An OutfitPlan, or its dict form (e.g. from agent
+                state).
+            sizes: Optional requested size per CATALOG category, e.g.
+                {"shirts": "M", "shoes": "8"}. OutfitPlan carries no size,
+                so no size filtering happens unless this is given.
 
-            if size:
-                requested_size = size.strip().lower()
+        Returns one entry per outfit item, in order:
 
-                size_confirmed: List[Product] = []
+            {
+                "index": 0,                  # stable position; labels may repeat
+                "source": "items",           # or "accessories"
+                "item": {...},               # the OutfitItem, unchanged
+                "search_params": {...},      # what was sent, or None if unsupported
+                "status": "ok" | "no_results" | "unsupported_category",
+                "products": [...],           # ranked product dicts
+            }
 
-                for product in products:
+        Items whose category is not in the catalog are NOT searched (no
+        unfiltered or color-only search); they come back as
+        "unsupported_category" with no products.
 
-                    has_size = any(
-                        available_size.strip().lower() == requested_size
-                        for available_size in product.sizes
-                    )
+        The plan's budget is applied to every item as an upper price bound.
+        A budget of None or 0 means no budget.
 
-                    # Do not call availability when the product does not
-                    # even advertise the requested size.
-                    if not has_size:
-                        continue
+        MCPConnectionError and MCPToolError are not caught. If one item's
+        search fails, the exception propagates and the whole call fails.
+        """
 
-                    availability = await client.check_availability(
-                        product.product_id,
-                        size=size,
-                    )
-
-                    if availability.get("available") is True:
-                        size_confirmed.append(product)
-
-                products = size_confirmed
-
-        # ---------------------------------------------------------------
-        # Rank products after MCP operations are complete.
-        # ---------------------------------------------------------------
-
-        requirements = {
-            "category": category,
-            "color": color,
-            "budget": budget,
-        }
-
-        ranked = rank_products(
-            products,
-            requirements,
+        plan = (
+            outfit_plan
+            if isinstance(outfit_plan, OutfitPlan)
+            else OutfitPlan.model_validate(outfit_plan)
         )
 
-        return [
-            product.model_dump()
-            for product in ranked
+        budget = plan.budget if plan.budget and plan.budget > 0 else None
+
+        outfit_items = [("items", item) for item in plan.items] + [
+            ("accessories", item) for item in plan.accessories
         ]
+
+        entries: List[Dict[str, Any]] = []
+
+        for index, (source, item) in enumerate(outfit_items):
+
+            category = resolve_item_category(item)
+
+            entry: Dict[str, Any] = {
+                "index": index,
+                "source": source,
+                "item": item.model_dump(),
+                "search_params": None,
+                "status": STATUS_UNSUPPORTED,
+                "products": [],
+            }
+
+            if category is not None:
+                entry["search_params"] = {
+                    "category": category,
+                    "color": normalize_color(item.color),
+                    "budget": budget,
+                    "size": (sizes or {}).get(category),
+                }
+
+            entries.append(entry)
+
+        searchable = [e for e in entries if e["search_params"] is not None]
+
+        # Nothing to search: do not even open an MCP connection.
+        if not searchable:
+            return entries
+
+        async with MCPShoppingClient() as client:
+
+            for entry in searchable:
+
+                params = entry["search_params"]
+
+                products = await self._search_with_client(
+                    client,
+                    query="",
+                    budget=params["budget"],
+                    category=params["category"],
+                    color=params["color"],
+                    size=params["size"],
+                )
+
+                entry["products"] = products
+                entry["status"] = STATUS_OK if products else STATUS_NO_RESULTS
+
+        return entries
+
+    async def build_outfit(
+        self,
+        outfit_plan: Union[OutfitPlan, Dict[str, Any]],
+        sizes: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Part 41: one product per outfit item, as one outfit.
+
+        Runs the Part 40 search once (search_outfit), then selects the
+        top-ranked candidate of each item. No additional search is made.
+        MCP errors propagate exactly as in search_outfit().
+        """
+
+        candidates = await self.search_outfit(outfit_plan, sizes=sizes)
+
+        return select_outfit(candidates)
 
     async def find_products(
         self,
